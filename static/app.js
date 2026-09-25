@@ -2313,15 +2313,47 @@ let runRevision = 0;
 // True while an option request is in flight: all option buttons stay
 // disabled, so a fast second click (same or another button) can never race.
 let runSubmitting = false;
+// Request generation of the preview session currently open. Every open bumps
+// it immediately and closing the modal bumps it again. A response — start,
+// choice or restart, success or 409 — is applied only when its captured
+// generation is still current AND it belongs to the session id currently
+// open; late responses of a closed/superseded session are dropped silently.
+let runEpoch = 0;
+function isRunCurrent(epoch, sessionId) {
+  return epoch === runEpoch && runId !== null && runId === sessionId;
+}
+
 async function openPreview() {
   if (!state.currentId) return;
-  if (state.dirty) await saveScript();
-  const r = await api("/api/runs", { method: "POST", body: { script_id: state.currentId } });
-  runId = r.run_id;
-  runRevision = r.revision || 0;
-  runSubmitting = false;
-  renderRun(r);
+  // New generation first: even two clicks before the modal paints get
+  // distinct generations, and only the latest start response is rendered.
+  const epoch = ++runEpoch;
+  runId = null;
+  runRevision = 0;
+  runSubmitting = true;  // block restart/choices until the new session arrives
+  $("#previewCard").innerHTML =
+    `<div class="q-card"><div class="q-text">正在开始新会话…</div></div>`;
+  $("#runPath").innerHTML = "";
+  $("#runRestart").disabled = true;
   openModal("previewModal");
+  try {
+    if (state.dirty) await saveScript();
+    if (epoch !== runEpoch) return;  // a newer open happened while saving
+    const r = await api("/api/runs", { method: "POST", body: { script_id: state.currentId } });
+    // A close or another open may have happened while the start request was
+    // in flight: the late response must never populate the newer session.
+    if (epoch !== runEpoch) return;
+    runId = r.run_id;
+    runRevision = r.revision || 0;
+    renderRun(r);
+  } catch (err) {
+    if (epoch !== runEpoch) return;
+    runSubmitting = false;
+    $("#runRestart").disabled = false;
+    $("#previewCard").innerHTML =
+      `<div class="q-card"><div class="q-text">开始会话失败：${esc(err.message)}</div></div>`;
+    toast(err.message);
+  }
 }
 
 // Disable every selectable option of the current question while submitting.
@@ -2335,6 +2367,7 @@ function setRunChoicesDisabled(disabled) {
 function renderRun(r) {
   runRevision = r.revision || 0;
   runSubmitting = false;
+  $("#runRestart").disabled = false;
   const node = r.current_node;
   const card = $("#previewCard");
   if (r.finished || node.terminal || !(node.options || []).length) {
@@ -2360,16 +2393,25 @@ function renderRun(r) {
     card.querySelectorAll("button[data-oid]").forEach((b) => {
       b.onclick = async () => {
         if (runSubmitting) return;
+        const epoch = runEpoch;
+        const sessionId = runId;
         runSubmitting = true;
         setRunChoicesDisabled(true);
         try {
-          const nr = await api(`/api/runs/${runId}/choice`, {
+          const nr = await api(`/api/runs/${sessionId}/choice`, {
             method: "POST",
             body: { option_id: b.dataset.oid, revision: runRevision },
           });
+          // Stale response: the preview was closed/reopened or another
+          // session is now open. Leave the current question/path untouched.
+          if (!isRunCurrent(epoch, sessionId)) return;
           renderRun(nr);
         } catch (err) {
+          if (!isRunCurrent(epoch, sessionId)) return;
           if (err.status === 409 && err.data?.detail?.run) {
+            // The conflict payload must be for the session currently open;
+            // only then may it replace the question card, path and revision.
+            if (err.data.detail.run.run_id !== sessionId) return;
             // A concurrent/duplicate submission lost the race: render the
             // authoritative latest session and let the user choose again.
             renderRun(err.data.detail.run);
@@ -2392,28 +2434,48 @@ function renderRun(r) {
 
 $("#runRestart").onclick = async () => {
   if (!runId || runSubmitting) return;
+  const epoch = runEpoch;
+  const sessionId = runId;
   runSubmitting = true;
   setRunChoicesDisabled(true);
   $("#runRestart").disabled = true;
   try {
     // Restart bumps the revision server-side: any in-flight option request
     // then comes back 409 and cannot repopulate the cleared path.
-    const r = await api(`/api/runs/${runId}/restart`, { method: "POST" });
+    const r = await api(`/api/runs/${sessionId}/restart`, { method: "POST" });
+    if (!isRunCurrent(epoch, sessionId)) return;
     renderRun(r);
   } catch (err) {
+    if (!isRunCurrent(epoch, sessionId)) return;
     runSubmitting = false;
     setRunChoicesDisabled(false);
-    toast(err.message);
-  } finally {
     $("#runRestart").disabled = false;
+    toast(err.message);
   }
 };
+
+// Closing the preview (✕, "关闭", ESC or mask click) invalidates every
+// in-flight callback of that session by starting a new generation and
+// dropping the session id; reopening always begins a fresh session whose
+// opening question a late response of the old session cannot overwrite.
+function invalidateRunSession() {
+  runEpoch += 1;
+  runId = null;
+  runRevision = 0;
+  runSubmitting = false;
+}
 
 // Closing the preview modal (✕ button, "关闭", ESC or mask click) refreshes the
 // branch coverage stats so newly recorded choices are reflected immediately.
 function bindCoverageAutoRefresh() {
   new MutationObserver(async () => {
-    if (document.getElementById("previewModal").classList.contains("open")) return;
+    const open = document.getElementById("previewModal").classList.contains("open");
+    if (!open) {
+      // Fires on every close, including the reopen gap; harmless to invalidate
+      // an already-empty generation before the next open bumps it again.
+      invalidateRunSession();
+    }
+    if (open) return;
     if (!state.currentId) return;
     await loadCoverage();
     renderInspector();
