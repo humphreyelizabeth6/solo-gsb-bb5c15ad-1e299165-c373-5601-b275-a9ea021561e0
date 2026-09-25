@@ -2313,10 +2313,27 @@ let runRevision = 0;
 // True while an option request is in flight: all option buttons stay
 // disabled, so a fast second click (same or another button) can never race.
 let runSubmitting = false;
+// Preview-open generation. Bumped every time the preview is opened (and
+// invalidated when it closes); async callbacks capture it together with the
+// session id and only touch the question card / path / revision / submit
+// state when both still match the currently open session. This keeps a late
+// response from a previous open (or an earlier "运行预览" click) from
+// overwriting the new session, and silences callbacks after close.
+let runGen = 0;
 async function openPreview() {
   if (!state.currentId) return;
+  const gen = ++runGen;  // invalidate callbacks from any previous open
   if (state.dirty) await saveScript();
-  const r = await api("/api/runs", { method: "POST", body: { script_id: state.currentId } });
+  let r;
+  try {
+    r = await api("/api/runs", { method: "POST", body: { script_id: state.currentId } });
+  } catch (err) {
+    if (gen === runGen) toast(err.message || "创建预览会话失败");
+    return;
+  }
+  // A newer open (or a close) superseded this request while it was in
+  // flight: drop the stale session instead of letting it take over the UI.
+  if (gen !== runGen) return;
   runId = r.run_id;
   runRevision = r.revision || 0;
   runSubmitting = false;
@@ -2360,15 +2377,22 @@ function renderRun(r) {
     card.querySelectorAll("button[data-oid]").forEach((b) => {
       b.onclick = async () => {
         if (runSubmitting) return;
+        // Bind this request to the session and preview-open generation that
+        // were current when the button was clicked.
+        const gen = runGen, sid = runId;
         runSubmitting = true;
         setRunChoicesDisabled(true);
         try {
-          const nr = await api(`/api/runs/${runId}/choice`, {
+          const nr = await api(`/api/runs/${sid}/choice`, {
             method: "POST",
             body: { option_id: b.dataset.oid, revision: runRevision },
           });
+          // Stale response (preview closed / reopened, or a newer session
+          // took over): leave the current session's card and path alone.
+          if (gen !== runGen || sid !== runId) return;
           renderRun(nr);
         } catch (err) {
+          if (gen !== runGen || sid !== runId) return;
           if (err.status === 409 && err.data?.detail?.run) {
             // A concurrent/duplicate submission lost the race: render the
             // authoritative latest session and let the user choose again.
@@ -2392,15 +2416,19 @@ function renderRun(r) {
 
 $("#runRestart").onclick = async () => {
   if (!runId || runSubmitting) return;
+  const gen = runGen, sid = runId;
   runSubmitting = true;
   setRunChoicesDisabled(true);
   $("#runRestart").disabled = true;
   try {
     // Restart bumps the revision server-side: any in-flight option request
     // then comes back 409 and cannot repopulate the cleared path.
-    const r = await api(`/api/runs/${runId}/restart`, { method: "POST" });
+    const r = await api(`/api/runs/${sid}/restart`, { method: "POST" });
+    // Only apply if this restart still belongs to the open preview session.
+    if (gen !== runGen || sid !== runId) return;
     renderRun(r);
   } catch (err) {
+    if (gen !== runGen || sid !== runId) return;
     runSubmitting = false;
     setRunChoicesDisabled(false);
     toast(err.message);
@@ -2409,11 +2437,16 @@ $("#runRestart").onclick = async () => {
   }
 };
 
-// Closing the preview modal (✕ button, "关闭", ESC or mask click) refreshes the
-// branch coverage stats so newly recorded choices are reflected immediately.
-function bindCoverageAutoRefresh() {
+// Closing the preview modal (✕ button, "关闭", ESC or mask click) invalidates
+// the current preview generation so in-flight start/option/restart callbacks
+// of the closed session become no-ops, and refreshes the branch coverage
+// stats so newly recorded choices are reflected immediately.
+function bindPreviewCloseHooks() {
   new MutationObserver(async () => {
     if (document.getElementById("previewModal").classList.contains("open")) return;
+    runGen++;            // stale callbacks of the closed session now no-op
+    runId = null;
+    runSubmitting = false;
     if (!state.currentId) return;
     await loadCoverage();
     renderInspector();
@@ -2542,7 +2575,7 @@ function bindCanvas() {
 (async function init() {
   bindToolbar();
   bindCanvas();
-  bindCoverageAutoRefresh();
+  bindPreviewCloseHooks();
   $("#funnelBody").addEventListener("click", onFunnelRowClick);
   await loadList();
   if (!state.scripts.length) await newScript(true);
